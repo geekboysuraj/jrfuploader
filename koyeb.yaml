@@ -1,0 +1,35 @@
+# Koyeb configuration for Telegram File Bot
+
+name: telegram-file-bot
+
+service:
+  name: telegram-file-bot
+  type: web
+  ports:
+    - port: 8080
+      protocol: http
+  routes:
+    - path: /
+      port: 8080
+  env:
+    - name: TELEGRAM_BOT_TOKEN
+      value: ""
+      secret: true
+  build:
+    builder: dockerfile
+    buildpacks:
+      - name: python
+  resources:
+    cpu: 0.25
+    memory: 512M
+  scaling:
+    min: 1
+    max: 1
+  healthcheck:
+    port: 8080
+    path: /
+    initial_delay: 30s
+    timeout: 10s
+    period: 30s
+    success_threshold: 1
+    failure_threshold: 3

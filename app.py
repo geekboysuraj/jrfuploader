@@ -511,10 +511,12 @@ def remove_webhook():
     return jsonify({'status': 'ok', 'message': 'Webhook removed'})
 
 if __name__ == '__main__':
-    # For local development, remove any existing webhook and use polling
-    bot.remove_webhook()
-    bot.polling()
-    
-    # For production, use the webhook
-    # port = int(os.environ.get("PORT", 5000))
-    # app.run(host="0.0.0.0", port=port)
+    # Check if running in production or development
+    if os.environ.get('FLASK_ENV') == 'development':
+        # For local development, remove any existing webhook and use polling
+        bot.remove_webhook()
+        bot.polling()
+    else:
+        # For production, use the webhook
+        port = int(os.environ.get("PORT", 10000))
+        app.run(host="0.0.0.0", port=port)

@@ -278,6 +278,12 @@ def download_and_upload(message, title, url):
                                 f"File {title} is too large ({file_size/(1024*1024*1024):.2f}GB). Maximum size is 1.5GB.")
                 return
             
+            # Warn user if file is large but under limit
+            if file_size > 200 * 1024 * 1024:  # 200MB
+                bot.send_message(message.chat.id,
+                               f"File {title} is large ({file_size/(1024*1024):.2f}MB). It will be uploaded in chunks to avoid Telegram API limitations.")
+
+            
             # Add "Downloaded by Suraj" to PDF files
             if file_extension.lower() == '.pdf':
                 file_path = add_text_to_pdf(file_path, temp_dir)
@@ -325,13 +331,31 @@ def download_and_upload(message, title, url):
                             status_msg.message_id
                         )
                         
-                        # Send the document
-                        bot.send_document(
-                            message.chat.id,
-                            file,
-                            caption=caption,
-                            reply_to_message_id=message.message_id
-                        )
+                        # Check file size for chunked upload
+                        file_size = os.path.getsize(file_path)
+                        
+                        if file_size > 45 * 1024 * 1024:  # 45MB - Below Telegram Bot API limit (50MB)
+                            # Use the dedicated chunked upload function
+                            file.seek(0)
+                            upload_in_chunks(file, file_path, title, file_extension, message, status_msg, caption)
+                        else:
+                            # Standard upload for files under 45MB
+                            try:
+                                bot.send_document(
+                                    message.chat.id,
+                                    file,
+                                    caption=caption,
+                                    reply_to_message_id=message.message_id
+                                )
+                            except Exception as doc_error:
+                                # If we get a 413 error, fall back to chunked upload
+                                if "413" in str(doc_error) and "Request Entity Too Large" in str(doc_error):
+                                    logger.warning(f"413 error encountered for {title}, switching to chunked upload")
+                                    file.seek(0)
+                                    upload_in_chunks(file, file_path, title, file_extension, message, status_msg, caption)
+                                else:
+                                    # Re-raise other errors
+                                    raise doc_error
                     
                     # Show 100% when complete
                     progress_bar = generate_progress_bar(100)
@@ -347,13 +371,32 @@ def download_and_upload(message, title, url):
                 except Exception as e:
                     logger.error(f"Error in upload thread: {str(e)}")
                     try:
-                        bot.edit_message_text(
-                            f"Error uploading {title}{file_extension}: {str(e)}", 
-                            message.chat.id, 
-                            status_msg.message_id
-                        )
-                    except:
-                        pass
+                        # Check for 413 error specifically
+                        if "413" in str(e) and "Request Entity Too Large" in str(e):
+                            bot.edit_message_text(
+                                f"Error uploading {title}{file_extension}: File too large for Telegram API (413 error).\nRetrying with chunked upload...", 
+                                message.chat.id, 
+                                status_msg.message_id
+                            )
+                            # Retry with forced chunked upload
+                            with open(file_path, 'rb') as retry_file:
+                                upload_in_chunks(retry_file, file_path, title, file_extension, message, status_msg, caption)
+                        else:
+                            bot.edit_message_text(
+                                f"Error uploading {title}{file_extension}: {str(e)}", 
+                                message.chat.id, 
+                                status_msg.message_id
+                            )
+                    except Exception as retry_error:
+                        logger.error(f"Error in retry upload: {str(retry_error)}")
+                        try:
+                            bot.edit_message_text(
+                                f"Failed to upload {title}{file_extension} after multiple attempts: {str(retry_error)}", 
+                                message.chat.id, 
+                                status_msg.message_id
+                            )
+                        except:
+                            pass
             
             # Start upload thread
             import threading
@@ -413,6 +456,62 @@ def download_file(url, title, file_extension, temp_dir, message=None, chat_id=No
     except Exception as e:
         logger.error(f"Error downloading file {url}: {str(e)}")
         return None
+
+# Function to upload file in chunks
+def upload_in_chunks(file, file_path, title, file_extension, message, status_msg, caption):
+    try:
+        file_size = os.path.getsize(file_path)
+        
+        # Update status message
+        progress_bar = generate_progress_bar(10)
+        bot.edit_message_text(
+            f"Using chunked upload for {title}{file_extension}... 10%\n{progress_bar}", 
+            message.chat.id, 
+            status_msg.message_id
+        )
+        
+        # Calculate optimal chunk size (max 50MB per chunk)
+        max_chunk_size = 45 * 1024 * 1024  # 45MB to be safe
+        total_chunks = (file_size + max_chunk_size - 1) // max_chunk_size
+        
+        # Send chunks
+        file.seek(0)
+        for chunk_num in range(1, total_chunks + 1):
+            # Read chunk
+            chunk_data = file.read(max_chunk_size)
+            
+            # Create appropriate caption
+            if total_chunks == 1:
+                chunk_caption = caption
+            elif chunk_num == total_chunks:
+                chunk_caption = f"{title} (Part {chunk_num}/{total_chunks} - Final)\n\nDownloaded by Suraj"
+            else:
+                chunk_caption = f"{title} (Part {chunk_num}/{total_chunks})\n\nDownloaded by Suraj"
+            
+            # Send chunk
+            bot.send_document(
+                message.chat.id,
+                chunk_data,
+                caption=chunk_caption,
+                reply_to_message_id=message.message_id
+            )
+            
+            # Update progress
+            progress = min(10 + (chunk_num / total_chunks) * 90, 100)
+            progress_bar = generate_progress_bar(int(progress))
+            bot.edit_message_text(
+                f"Uploading {title}{file_extension}... {int(progress)}%\n{progress_bar}", 
+                message.chat.id, 
+                status_msg.message_id
+            )
+            
+            # Small delay between chunks to avoid rate limiting
+            time.sleep(2)
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error in chunked upload: {str(e)}")
+        raise Exception(f"Chunked upload failed: {str(e)}")
 
 # Function to generate a progress bar
 def generate_progress_bar(percentage, length=20):

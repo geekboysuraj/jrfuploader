@@ -5,6 +5,8 @@ import tempfile
 import re
 import subprocess
 import json
+import time
+import threading
 from flask import Flask, request, jsonify
 import telebot
 from telebot.types import Message
@@ -263,7 +265,7 @@ def download_and_upload(message, title, url):
             if '.m3u8' in url or file_extension.lower() in ['.mp4', '.mkv']:
                 file_path = download_with_n_m3u8dl(url, title, file_extension, temp_dir)
             else:
-                file_path = download_file(url, title, file_extension, temp_dir)
+                file_path = download_file(url, title, file_extension, temp_dir, message, message.chat.id)
             
             if not file_path or not os.path.exists(file_path):
                 bot.send_message(message.chat.id, f"Failed to download: {title}")
@@ -280,56 +282,154 @@ def download_and_upload(message, title, url):
             if file_extension.lower() == '.pdf':
                 file_path = add_text_to_pdf(file_path, temp_dir)
             
-            # Send status message
-            status_msg = bot.send_message(message.chat.id, f"Uploading {title}{file_extension}...")
+            # Send status message with initial progress bar
+            progress_bar = generate_progress_bar(0)
+            status_msg = bot.send_message(message.chat.id, f"Uploading {title}{file_extension}... 0%\n{progress_bar}")
             
             # Create caption with "Downloaded by Suraj"
             caption = f"{title}\n\nDownloaded by Suraj"
             
-            # Upload the file to Telegram
-            with open(file_path, 'rb') as file:
-                bot.send_document(
-                    message.chat.id,
-                    file,
-                    caption=caption,
-                    reply_to_message_id=message.message_id
-                )
+            # Upload the file to Telegram with progress tracking
+            # Since Telegram API doesn't provide direct upload progress,
+            # we'll simulate progress based on file size
+            file_size_mb = file_size / (1024 * 1024)
+            estimated_upload_time = file_size_mb * 0.1  # Rough estimate: 0.1 seconds per MB
+            upload_steps = min(20, int(file_size_mb))  # Max 20 steps for large files
+            if upload_steps < 5:
+                upload_steps = 5  # Minimum 5 steps for small files
             
-            # Delete status message
-            bot.delete_message(message.chat.id, status_msg.message_id)
+            # Calculate sleep time between progress updates
+            sleep_time = estimated_upload_time / upload_steps
+            
+            # Start upload in a separate thread to avoid blocking
+            def upload_with_progress():
+                try:
+                    # Simulate upload progress
+                    for i in range(1, upload_steps):
+                        percentage = int((i / upload_steps) * 90)  # Go up to 90%
+                        progress_bar = generate_progress_bar(percentage)
+                        bot.edit_message_text(
+                            f"Uploading {title}{file_extension}... {percentage}%\n{progress_bar}", 
+                            message.chat.id, 
+                            status_msg.message_id
+                        )
+                        time.sleep(sleep_time)
+                    
+                    # Actual upload
+                    with open(file_path, 'rb') as file:
+                        # Show 95% before actual upload
+                        progress_bar = generate_progress_bar(95)
+                        bot.edit_message_text(
+                            f"Uploading {title}{file_extension}... 95%\n{progress_bar}", 
+                            message.chat.id, 
+                            status_msg.message_id
+                        )
+                        
+                        # Send the document
+                        bot.send_document(
+                            message.chat.id,
+                            file,
+                            caption=caption,
+                            reply_to_message_id=message.message_id
+                        )
+                    
+                    # Show 100% when complete
+                    progress_bar = generate_progress_bar(100)
+                    bot.edit_message_text(
+                        f"Upload complete: {title}{file_extension} ✅\n{progress_bar}", 
+                        message.chat.id, 
+                        status_msg.message_id
+                    )
+                    
+                    # Delete status message after a short delay
+                    time.sleep(3)
+                    bot.delete_message(message.chat.id, status_msg.message_id)
+                except Exception as e:
+                    logger.error(f"Error in upload thread: {str(e)}")
+                    try:
+                        bot.edit_message_text(
+                            f"Error uploading {title}{file_extension}: {str(e)}", 
+                            message.chat.id, 
+                            status_msg.message_id
+                        )
+                    except:
+                        pass
+            
+            # Start upload thread
+            import threading
+            upload_thread = threading.Thread(target=upload_with_progress)
+            upload_thread.start()
+            
+            # Wait for thread to complete (optional, can be removed if you want non-blocking behavior)
+            upload_thread.join()
             
     except Exception as e:
         logger.error(f"Error downloading/uploading {title}: {str(e)}")
         bot.send_message(message.chat.id, f"Error processing: {title}\nError: {str(e)}")
 
 # Function to download a file
-def download_file(url, title, file_extension, temp_dir):
+def download_file(url, title, file_extension, temp_dir, message=None, chat_id=None):
     try:
         response = requests.get(url, stream=True, timeout=300)
         response.raise_for_status()
         
         file_path = os.path.join(temp_dir, f"{title}{file_extension}")
         
+        # Get total file size if available
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        last_percentage = 0
+        status_msg = None
+        
+        if message and chat_id and total_size > 0:
+            status_msg = bot.send_message(chat_id, f"Downloading {title}{file_extension}... 0%")
+        
         with open(file_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
+                    downloaded += len(chunk)
+                    
+                    # Update progress every 5%
+                    if total_size > 0 and message and chat_id:
+                        current_percentage = int((downloaded / total_size) * 100)
+                        if current_percentage >= last_percentage + 5 or current_percentage == 100:
+                            progress_bar = generate_progress_bar(current_percentage)
+                            bot.edit_message_text(
+                                f"Downloading {title}{file_extension}... {current_percentage}%\n{progress_bar}", 
+                                chat_id, 
+                                status_msg.message_id
+                            )
+                            last_percentage = current_percentage
         
+        # Delete status message if download completed
+        if status_msg:
+            try:
+                bot.delete_message(chat_id, status_msg.message_id)
+            except:
+                pass
+                
         return file_path
     except Exception as e:
         logger.error(f"Error downloading file {url}: {str(e)}")
         return None
 
+# Function to generate a progress bar
+def generate_progress_bar(percentage, length=20):
+    filled_length = int(length * percentage // 100)
+    bar = '█' * filled_length + '░' * (length - filled_length)
+    return f"[{bar}] {percentage}%"
+
 # Function to download with N_m3u8DL-RE
-def download_with_n_m3u8dl(url, title, file_extension, temp_dir):
+def download_with_n_m3u8dl(url, title, file_extension, temp_dir, message=None, chat_id=None):
     try:
         # Sanitize title for filename
         safe_title = re.sub(r'[\\/*?:"<>|]', "_", title)
         output_file = os.path.join(temp_dir, f"{safe_title}{file_extension}")
         
-        # Prepare N_m3u8DL-RE command
+        # Prepare N_m3u8DL-RE command with .exe extension for Windows
         cmd = [
-            "N_m3u8DL-RE",
+            "N_m3u8DL-RE.exe",
             "--save-dir", temp_dir,
             "--save-name", safe_title,
             "--thread-count", "16",
@@ -337,17 +437,60 @@ def download_with_n_m3u8dl(url, title, file_extension, temp_dir):
             url
         ]
         
-        # Run N_m3u8DL-RE
+        # Send initial status message if message and chat_id are provided
+        status_msg = None
+        if message and chat_id:
+            progress_bar = generate_progress_bar(0)
+            status_msg = bot.send_message(chat_id, f"Preparing to download {title} with N_m3u8DL-RE... 0%\n{progress_bar}")
+            
+        # Run N_m3u8DL-RE with progress updates
         logger.info(f"Running N_m3u8DL-RE for {url}")
-        process = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Start process with pipe for output
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+        
+        # Track progress
+        progress_pattern = re.compile(r'(\d+\.?\d*)%')
+        last_percentage = 0
+        
+        # Read output line by line
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+                
+            # Try to extract progress percentage
+            match = progress_pattern.search(line)
+            if match and status_msg:
+                try:
+                    current_percentage = float(match.group(1))
+                    if int(current_percentage) >= last_percentage + 5 or current_percentage >= 99.5:
+                        progress_bar = generate_progress_bar(int(current_percentage))
+                        bot.edit_message_text(
+                            f"Downloading {title} with N_m3u8DL-RE... {int(current_percentage)}%\n{progress_bar}", 
+                            chat_id, 
+                            status_msg.message_id
+                        )
+                        last_percentage = int(current_percentage)
+                except Exception as e:
+                    logger.error(f"Error updating progress: {str(e)}")
+        
+        # Wait for process to complete
+        process.wait()
+        
+        # Delete status message if download completed
+        if status_msg:
+            try:
+                bot.delete_message(chat_id, status_msg.message_id)
+            except:
+                pass
         
         if process.returncode != 0:
             logger.error(f"N_m3u8DL-RE error: {process.stderr}")
-            # Fallback to old method if N_m3u8DL-RE fails
+            # Fallback to yt-dlp if N_m3u8DL-RE fails for m3u8 files
             if url.endswith('.m3u8'):
-                return download_m3u8_fallback(url, title, temp_dir)
+                return download_with_ytdlp(url, title, temp_dir, message, chat_id)
             else:
-                return download_file(url, title, file_extension, temp_dir)
+                return download_file(url, title, file_extension, temp_dir, message, chat_id)
         
         # Find the downloaded file
         for file in os.listdir(temp_dir):
@@ -360,21 +503,100 @@ def download_with_n_m3u8dl(url, title, file_extension, temp_dir):
             return output_file
         
         # Fallback
-        logger.warning(f"N_m3u8DL-RE didn't create expected file, falling back to standard method")
+        logger.warning(f"N_m3u8DL-RE didn't create expected file, falling back to yt-dlp")
         if url.endswith('.m3u8'):
-            return download_m3u8_fallback(url, title, temp_dir)
+            return download_with_ytdlp(url, title, temp_dir, message, chat_id)
         else:
-            return download_file(url, title, file_extension, temp_dir)
+            return download_file(url, title, file_extension, temp_dir, message, chat_id)
     except Exception as e:
         logger.error(f"Error using N_m3u8DL-RE for {url}: {str(e)}")
-        # Fallback to old method
+        # Fallback to yt-dlp
         if url.endswith('.m3u8'):
-            return download_m3u8_fallback(url, title, temp_dir)
+            return download_with_ytdlp(url, title, temp_dir, message, chat_id)
         else:
-            return download_file(url, title, file_extension, temp_dir)
+            return download_file(url, title, file_extension, temp_dir, message, chat_id)
 
-# Function to download m3u8 files (fallback method)
-def download_m3u8_fallback(url, title, temp_dir):
+# Function to download m3u8 files using yt-dlp (preferred fallback)
+def download_with_ytdlp(url, title, temp_dir, message=None, chat_id=None):
+    try:
+        # Sanitize title for filename
+        safe_title = re.sub(r'[\/*?:"<>|]', "_", title)
+        output_file = os.path.join(temp_dir, f"{safe_title}.mp4")
+        
+        # Send initial status message if message and chat_id are provided
+        status_msg = None
+        if message and chat_id:
+            progress_bar = generate_progress_bar(0)
+            status_msg = bot.send_message(chat_id, f"Downloading {title} with yt-dlp... 0%\n{progress_bar}")
+        
+        # Prepare yt-dlp command
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--format", "best",
+            "--output", output_file,
+            "--no-warnings",
+            url
+        ]
+        
+        # Run yt-dlp with progress updates
+        logger.info(f"Running yt-dlp for {url}")
+        
+        # Start process with pipe for output
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+        
+        # Track progress
+        progress_pattern = re.compile(r'(\d+\.?\d*)%')
+        last_percentage = 0
+        
+        # Read output line by line
+        for line in iter(process.stdout.readline, ''):
+            if not line:
+                break
+                
+            # Try to extract progress percentage
+            match = progress_pattern.search(line)
+            if match and status_msg:
+                try:
+                    current_percentage = float(match.group(1))
+                    if int(current_percentage) >= last_percentage + 5 or current_percentage >= 99.5:
+                        progress_bar = generate_progress_bar(int(current_percentage))
+                        bot.edit_message_text(
+                            f"Downloading {title} with yt-dlp... {int(current_percentage)}%\n{progress_bar}", 
+                            chat_id, 
+                            status_msg.message_id
+                        )
+                        last_percentage = int(current_percentage)
+                except Exception as e:
+                    logger.error(f"Error updating progress: {str(e)}")
+        
+        # Wait for process to complete
+        process.wait()
+        
+        # Delete status message if download completed
+        if status_msg:
+            try:
+                bot.delete_message(chat_id, status_msg.message_id)
+            except:
+                pass
+        
+        if process.returncode != 0:
+            logger.error(f"yt-dlp error: {process.stderr}")
+            # Fallback to original m3u8 method if yt-dlp fails
+            return download_m3u8_fallback(url, title, temp_dir, message, chat_id)
+        
+        if os.path.exists(output_file):
+            return output_file
+        else:
+            # Fallback to original m3u8 method if file not found
+            return download_m3u8_fallback(url, title, temp_dir, message, chat_id)
+    except Exception as e:
+        logger.error(f"Error using yt-dlp for {url}: {str(e)}")
+        # Fallback to original m3u8 method
+        return download_m3u8_fallback(url, title, temp_dir, message, chat_id)
+
+# Function to download m3u8 files (original fallback method)
+def download_m3u8_fallback(url, title, temp_dir, message=None, chat_id=None):
     try:
         # Parse the m3u8 file
         m3u8_obj = m3u8.load(url)
@@ -401,8 +623,16 @@ def download_m3u8_fallback(url, title, temp_dir):
         
         base_url = url.rsplit('/', 1)[0] if '/' in url else ''
         
+        # Send initial status message if message and chat_id are provided
+        status_msg = None
+        if message and chat_id:
+            progress_bar = generate_progress_bar(0)
+            status_msg = bot.send_message(chat_id, f"Downloading m3u8 segments for {title}... 0%\n{progress_bar}")
+        
         # Download each segment
         segment_files = []
+        total_segments = len(m3u8_obj.segments)
+        
         for i, segment in enumerate(m3u8_obj.segments):
             segment_url = segment.uri
             if not segment_url.startswith('http'):
@@ -411,13 +641,44 @@ def download_m3u8_fallback(url, title, temp_dir):
             segment_file = os.path.join(segments_dir, f"segment_{i:05d}.ts")
             download_file(segment_url, f"segment_{i:05d}", ".ts", segments_dir)
             segment_files.append(segment_file)
+            
+            # Update progress every 5% or for every 10 segments
+            if message and chat_id and (i % 10 == 0 or i == total_segments - 1):
+                percentage = int((i + 1) / total_segments * 100)
+                progress_bar = generate_progress_bar(percentage)
+                try:
+                    bot.edit_message_text(
+                        f"Downloading m3u8 segments for {title}... {percentage}%\n{progress_bar}\nSegment {i+1}/{total_segments}", 
+                        chat_id, 
+                        status_msg.message_id
+                    )
+                except Exception as e:
+                    logger.error(f"Error updating m3u8 progress: {str(e)}")
         
+        # Update status message for concatenation phase
+        if status_msg:
+            try:
+                bot.edit_message_text(
+                    f"Combining segments for {title}... Please wait.", 
+                    chat_id, 
+                    status_msg.message_id
+                )
+            except:
+                pass
+                
         # Concatenate segments
         with open(output_file, 'wb') as outfile:
             for segment_file in segment_files:
                 if os.path.exists(segment_file):
                     with open(segment_file, 'rb') as infile:
                         outfile.write(infile.read())
+        
+        # Delete status message if download completed
+        if status_msg:
+            try:
+                bot.delete_message(chat_id, status_msg.message_id)
+            except:
+                pass
         
         return output_file
     except Exception as e:

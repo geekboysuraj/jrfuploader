@@ -51,6 +51,20 @@ A Telegram bot built with Python and Flask that can download files from URLs and
    https://your-render-url.onrender.com/set_webhook?url=https://your-render-url.onrender.com
    ```
 
+### Deployment on Koyeb (Free Tier)
+
+1. Sign up for a free Koyeb account at [koyeb.com](https://www.koyeb.com/)
+2. Install the Koyeb CLI or use the Koyeb web dashboard
+3. Connect your GitHub repository to Koyeb
+4. Deploy using the provided Dockerfile and koyeb.yaml configuration:
+   - The free tier includes 2 nano services with shared CPU and 512MB RAM
+   - Koyeb will automatically build and deploy your application
+5. Add the `TELEGRAM_BOT_TOKEN` secret in the Koyeb dashboard
+6. Once deployed, set the webhook by visiting:
+   ```
+   https://your-koyeb-app-url.koyeb.app/set_webhook?url=https://your-koyeb-app-url.koyeb.app
+   ```
+
 ## Usage
 
 1. Start a chat with your bot and send `/start` to get a welcome message
